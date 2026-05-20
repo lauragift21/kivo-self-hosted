@@ -1,0 +1,605 @@
+import { Hono } from 'hono';
+import type { Env, Variables } from '../types';
+import {
+  createInvoiceSchema,
+  updateInvoiceSchema,
+  invoiceFilterSchema,
+  calculateInvoiceTotals,
+  generateInvoiceNumber,
+} from '@kivo/shared';
+import type { Invoice, InvoiceItem, InvoiceWithClient, Client, Settings } from '@kivo/shared';
+import { ValidationError, NotFoundError } from '../utils/errors';
+import { generateUUID, generateToken } from '../utils/crypto';
+import { authMiddleware } from '../middleware/auth';
+import { PDFService } from '../services/pdf';
+import { EmailService } from '../services/email';
+import { AnalyticsService } from '../services/analytics';
+
+const invoices = new Hono<{ Bindings: Env; Variables: Variables }>();
+
+invoices.use('/*', authMiddleware);
+
+/**
+ * List invoices with filtering and pagination
+ */
+invoices.get('/', async (c) => {
+  const requestId = c.get('requestId');
+
+  const query = c.req.query();
+  const result = invoiceFilterSchema.safeParse({
+    status: query.status || undefined,
+    client_id: query.client_id || undefined,
+    date_from: query.date_from || undefined,
+    date_to: query.date_to || undefined,
+    page: query.page ? parseInt(query.page) : 1,
+    limit: query.limit ? parseInt(query.limit) : 20,
+  });
+
+  if (!result.success) {
+    throw new ValidationError('Invalid filter parameters', result.error.flatten());
+  }
+
+  const filters = result.data;
+  const offset = (filters.page - 1) * filters.limit;
+
+  let whereClause = '1=1';
+  const params: any[] = [];
+
+  if (filters.status) {
+    whereClause += ' AND status = ?';
+    params.push(filters.status);
+  }
+  if (filters.client_id) {
+    whereClause += ' AND client_id = ?';
+    params.push(filters.client_id);
+  }
+  if (filters.date_from) {
+    whereClause += ' AND issue_date >= ?';
+    params.push(filters.date_from);
+  }
+  if (filters.date_to) {
+    whereClause += ' AND issue_date <= ?';
+    params.push(filters.date_to);
+  }
+
+  const countResult = await c.env.DB.prepare(
+    `SELECT COUNT(*) as count FROM invoices WHERE ${whereClause}`
+  ).bind(...params).first<{ count: number }>();
+
+  const total = countResult?.count || 0;
+
+  const invoicesResult = await c.env.DB.prepare(
+    `SELECT i.*, c.name as client_name, c.email as client_email, c.company as client_company
+     FROM invoices i
+     LEFT JOIN clients c ON i.client_id = c.id
+     WHERE ${whereClause}
+     ORDER BY i.created_at DESC
+     LIMIT ? OFFSET ?`
+  ).bind(...params, filters.limit, offset).all();
+
+  return c.json({
+    data: invoicesResult.results,
+    pagination: {
+      page: filters.page,
+      limit: filters.limit,
+      total,
+      total_pages: Math.ceil(total / filters.limit),
+    },
+    requestId,
+  });
+});
+
+/**
+ * Get a single invoice with items and client
+ */
+invoices.get('/:id', async (c) => {
+  const requestId = c.get('requestId');
+  const invoiceId = c.req.param('id');
+
+  const invoice = await c.env.DB.prepare(
+    'SELECT * FROM invoices WHERE id = ?'
+  ).bind(invoiceId).first<Invoice>();
+
+  if (!invoice) {
+    throw new NotFoundError('Invoice');
+  }
+
+  const client = await c.env.DB.prepare(
+    'SELECT id, name, email, company, address FROM clients WHERE id = ?'
+  ).bind(invoice.client_id).first();
+
+  const items = await c.env.DB.prepare(
+    'SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order'
+  ).bind(invoiceId).all<InvoiceItem>();
+
+  const events = await c.env.DB.prepare(
+    'SELECT * FROM invoice_events WHERE invoice_id = ? ORDER BY created_at DESC'
+  ).bind(invoiceId).all();
+
+  const payments = await c.env.DB.prepare(
+    'SELECT * FROM payments WHERE invoice_id = ? ORDER BY created_at DESC'
+  ).bind(invoiceId).all();
+
+  return c.json({
+    data: {
+      ...invoice,
+      client,
+      items: items.results,
+      events: events.results,
+      payments: payments.results,
+    },
+    requestId,
+  });
+});
+
+/**
+ * Create a new invoice
+ */
+invoices.post('/', async (c) => {
+  const requestId = c.get('requestId');
+
+  const body = await c.req.json();
+  const result = createInvoiceSchema.safeParse(body);
+
+  if (!result.success) {
+    throw new ValidationError('Invalid input', result.error.flatten());
+  }
+
+  const data = result.data;
+
+  const client = await c.env.DB.prepare(
+    'SELECT id FROM clients WHERE id = ? AND archived = 0'
+  ).bind(data.client_id).first();
+
+  if (!client) {
+    throw new NotFoundError('Client');
+  }
+
+  const settings = await c.env.DB.prepare(
+    'SELECT * FROM settings LIMIT 1'
+  ).first<Settings>();
+
+  const totals = calculateInvoiceTotals(
+    data.items,
+    data.discount_type,
+    data.discount_value
+  );
+
+  const invoiceId = generateUUID();
+  const now = new Date().toISOString();
+
+  let invoiceNumber = data.invoice_number?.trim();
+  if (!invoiceNumber && settings) {
+    invoiceNumber = generateInvoiceNumber(settings.invoice_prefix, settings.next_invoice_number);
+    await c.env.DB.prepare(
+      'UPDATE settings SET next_invoice_number = next_invoice_number + 1, updated_at = ?'
+    ).bind(now).run();
+  }
+
+  await c.env.DB.prepare(
+    `INSERT INTO invoices (
+      id, client_id, invoice_number, status, issue_date, due_date,
+      currency, subtotal, tax_total, discount_type, discount_value, discount_amount,
+      total, notes, payment_terms, reminders_enabled, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    invoiceId, data.client_id, invoiceNumber, data.issue_date, data.due_date,
+    data.currency, totals.subtotal, totals.tax_total, data.discount_type || null,
+    data.discount_value || null, totals.discount_amount, totals.total,
+    data.notes || null, data.payment_terms || null, data.reminders_enabled !== false ? 1 : 0,
+    now, now
+  ).run();
+
+  for (let i = 0; i < data.items.length; i++) {
+    const item = data.items[i];
+    const itemId = generateUUID();
+    const itemAmount = totals.item_amounts[i];
+
+    await c.env.DB.prepare(
+      `INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(itemId, invoiceId, item.description, item.quantity, item.unit_price, item.tax_rate || null, itemAmount, i).run();
+  }
+
+  await c.env.DB.prepare(
+    `INSERT INTO invoice_events (id, invoice_id, event_type, created_at)
+     VALUES (?, ?, 'created', ?)`
+  ).bind(generateUUID(), invoiceId, now).run();
+
+  const analytics = new AnalyticsService();
+  analytics.trackInvoiceCreated(invoiceId, totals.total, data.currency);
+
+  const invoice = await getInvoiceWithDetails(c.env.DB, invoiceId);
+
+  return c.json({
+    data: invoice,
+    requestId,
+  }, 201);
+});
+
+/**
+ * Update an invoice
+ */
+invoices.patch('/:id', async (c) => {
+  const requestId = c.get('requestId');
+  const invoiceId = c.req.param('id');
+
+  const existingInvoice = await c.env.DB.prepare(
+    'SELECT * FROM invoices WHERE id = ?'
+  ).bind(invoiceId).first<Invoice>();
+
+  if (!existingInvoice) {
+    throw new NotFoundError('Invoice');
+  }
+
+  const body = await c.req.json();
+  const result = updateInvoiceSchema.safeParse(body);
+
+  if (!result.success) {
+    throw new ValidationError('Invalid input', result.error.flatten());
+  }
+
+  const data = result.data;
+  const now = new Date().toISOString();
+
+  if (data.items && existingInvoice.status !== 'draft') {
+    throw new ValidationError('Cannot modify items on a non-draft invoice');
+  }
+
+  let totals;
+  if (data.items) {
+    totals = calculateInvoiceTotals(
+      data.items,
+      data.discount_type ?? existingInvoice.discount_type,
+      data.discount_value ?? existingInvoice.discount_value
+    );
+
+    await c.env.DB.prepare(
+      'DELETE FROM invoice_items WHERE invoice_id = ?'
+    ).bind(invoiceId).run();
+
+    for (let i = 0; i < data.items.length; i++) {
+      const item = data.items[i];
+      const itemId = generateUUID();
+      const itemAmount = totals.item_amounts[i];
+
+      await c.env.DB.prepare(
+        `INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(itemId, invoiceId, item.description, item.quantity, item.unit_price, item.tax_rate || null, itemAmount, i).run();
+    }
+  }
+
+  const fields: string[] = ['updated_at = ?'];
+  const values: any[] = [now];
+
+  if (data.client_id !== undefined) {
+    fields.push('client_id = ?');
+    values.push(data.client_id);
+  }
+  if (data.invoice_number !== undefined) {
+    fields.push('invoice_number = ?');
+    values.push(data.invoice_number);
+  }
+  if (data.status !== undefined) {
+    fields.push('status = ?');
+    values.push(data.status);
+  }
+  if (data.issue_date !== undefined) {
+    fields.push('issue_date = ?');
+    values.push(data.issue_date);
+  }
+  if (data.due_date !== undefined) {
+    fields.push('due_date = ?');
+    values.push(data.due_date);
+  }
+  if (data.currency !== undefined) {
+    fields.push('currency = ?');
+    values.push(data.currency);
+  }
+  if (data.notes !== undefined) {
+    fields.push('notes = ?');
+    values.push(data.notes);
+  }
+  if (data.payment_terms !== undefined) {
+    fields.push('payment_terms = ?');
+    values.push(data.payment_terms);
+  }
+  if (data.reminders_enabled !== undefined) {
+    fields.push('reminders_enabled = ?');
+    values.push(data.reminders_enabled ? 1 : 0);
+  }
+  if (data.discount_type !== undefined) {
+    fields.push('discount_type = ?');
+    values.push(data.discount_type);
+  }
+  if (data.discount_value !== undefined) {
+    fields.push('discount_value = ?');
+    values.push(data.discount_value);
+  }
+
+  if (totals) {
+    fields.push('subtotal = ?', 'tax_total = ?', 'discount_amount = ?', 'total = ?');
+    values.push(totals.subtotal, totals.tax_total, totals.discount_amount, totals.total);
+  }
+
+  values.push(invoiceId);
+
+  await c.env.DB.prepare(
+    `UPDATE invoices SET ${fields.join(', ')} WHERE id = ?`
+  ).bind(...values).run();
+
+  if (data.status && data.status !== existingInvoice.status) {
+    await c.env.DB.prepare(
+      `INSERT INTO invoice_events (id, invoice_id, event_type, metadata, created_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).bind(
+      generateUUID(),
+      invoiceId,
+      data.status === 'void' ? 'voided' : 'updated',
+      JSON.stringify({ old_status: existingInvoice.status, new_status: data.status }),
+      now
+    ).run();
+  }
+
+  const invoice = await getInvoiceWithDetails(c.env.DB, invoiceId);
+
+  return c.json({
+    data: invoice,
+    requestId,
+  });
+});
+
+/**
+ * Send invoice to client
+ */
+invoices.post('/:id/send', async (c) => {
+  const requestId = c.get('requestId');
+  const invoiceId = c.req.param('id');
+
+  const invoice = await c.env.DB.prepare(
+    'SELECT * FROM invoices WHERE id = ?'
+  ).bind(invoiceId).first<Invoice>();
+
+  if (!invoice) {
+    throw new NotFoundError('Invoice');
+  }
+
+  if (invoice.status === 'paid' || invoice.status === 'void') {
+    throw new ValidationError('Cannot send a paid or void invoice');
+  }
+
+  const client = await c.env.DB.prepare(
+    'SELECT * FROM clients WHERE id = ?'
+  ).bind(invoice.client_id).first<Client>();
+
+  if (!client) {
+    throw new NotFoundError('Client');
+  }
+
+  const settings = await c.env.DB.prepare(
+    'SELECT * FROM settings LIMIT 1'
+  ).first<Settings>();
+
+  const now = new Date().toISOString();
+
+  let publicToken = await c.env.DB.prepare(
+    'SELECT token FROM invoice_public_tokens WHERE invoice_id = ?'
+  ).bind(invoiceId).first<{ token: string }>();
+
+  if (!publicToken) {
+    const token = generateToken(32);
+    await c.env.DB.prepare(
+      `INSERT INTO invoice_public_tokens (id, invoice_id, token, created_at)
+       VALUES (?, ?, ?, ?)`
+    ).bind(generateUUID(), invoiceId, token, now).run();
+    publicToken = { token };
+  }
+
+  const publicUrl = `${c.env.FRONTEND_URL}/invoice/${publicToken.token}`;
+
+  const emailService = new EmailService(c.env.EMAIL, c.env.FROM_EMAIL);
+  await emailService.sendInvoice(
+    client.email,
+    invoice.invoice_number,
+    settings?.business_name || 'Kivo',
+    invoice.total,
+    invoice.currency as any,
+    invoice.due_date,
+    publicUrl,
+    settings?.email_from_name || undefined
+  );
+
+  await c.env.DB.prepare(
+    "UPDATE invoices SET status = 'sent', updated_at = ? WHERE id = ?"
+  ).bind(now, invoiceId).run();
+
+  await c.env.DB.prepare(
+    `INSERT INTO invoice_events (id, invoice_id, event_type, metadata, created_at)
+     VALUES (?, ?, 'sent', ?, ?)`
+  ).bind(generateUUID(), invoiceId, JSON.stringify({ email: client.email }), now).run();
+
+  const analytics = new AnalyticsService();
+  analytics.trackInvoiceSent(invoiceId);
+
+  if (invoice.reminders_enabled) {
+    const reminderDOId = c.env.REMINDER_SCHEDULER.idFromName('default');
+    const reminderDO = c.env.REMINDER_SCHEDULER.get(reminderDOId);
+
+    await reminderDO.fetch('http://internal/schedule', {
+      method: 'POST',
+      body: JSON.stringify({
+        invoice_id: invoiceId,
+        due_date: invoice.due_date,
+      }),
+    });
+  }
+
+  return c.json({
+    data: {
+      message: 'Invoice sent successfully',
+      public_url: publicUrl,
+    },
+    requestId,
+  });
+});
+
+/**
+ * Duplicate an invoice
+ */
+invoices.post('/:id/duplicate', async (c) => {
+  const requestId = c.get('requestId');
+  const invoiceId = c.req.param('id');
+
+  const original = await getInvoiceWithDetails(c.env.DB, invoiceId);
+
+  if (!original) {
+    throw new NotFoundError('Invoice');
+  }
+
+  const settings = await c.env.DB.prepare(
+    'SELECT * FROM settings LIMIT 1'
+  ).first<Settings>();
+
+  const newInvoiceId = generateUUID();
+  const now = new Date().toISOString();
+  const today = now.split('T')[0];
+
+  const newInvoiceNumber = settings
+    ? generateInvoiceNumber(settings.invoice_prefix, settings.next_invoice_number)
+    : `INV-${Date.now()}`;
+
+  if (settings) {
+    await c.env.DB.prepare(
+      'UPDATE settings SET next_invoice_number = next_invoice_number + 1, updated_at = ?'
+    ).bind(now).run();
+  }
+
+  await c.env.DB.prepare(
+    `INSERT INTO invoices (
+      id, client_id, invoice_number, status, issue_date, due_date,
+      currency, subtotal, tax_total, discount_type, discount_value, discount_amount,
+      total, notes, payment_terms, reminders_enabled, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    newInvoiceId, original.client_id, newInvoiceNumber, today, original.due_date,
+    original.currency, original.subtotal, original.tax_total, original.discount_type,
+    original.discount_value, original.discount_amount, original.total,
+    original.notes, original.payment_terms, original.reminders_enabled ? 1 : 0,
+    now, now
+  ).run();
+
+  for (const item of original.items) {
+    await c.env.DB.prepare(
+      `INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(generateUUID(), newInvoiceId, item.description, item.quantity, item.unit_price, item.tax_rate, item.amount, item.sort_order).run();
+  }
+
+  await c.env.DB.prepare(
+    `INSERT INTO invoice_events (id, invoice_id, event_type, metadata, created_at)
+     VALUES (?, ?, 'created', ?, ?)`
+  ).bind(generateUUID(), newInvoiceId, JSON.stringify({ duplicated_from: invoiceId }), now).run();
+
+  const newInvoice = await getInvoiceWithDetails(c.env.DB, newInvoiceId);
+
+  return c.json({
+    data: newInvoice,
+    requestId,
+  }, 201);
+});
+
+/**
+ * Generate/regenerate PDF for invoice
+ */
+invoices.post('/:id/pdf', async (c) => {
+  const requestId = c.get('requestId');
+  const invoiceId = c.req.param('id');
+
+  const invoice = await getInvoiceWithDetails(c.env.DB, invoiceId);
+
+  if (!invoice) {
+    throw new NotFoundError('Invoice');
+  }
+
+  const settings = await c.env.DB.prepare(
+    'SELECT * FROM settings LIMIT 1'
+  ).first<Settings>();
+
+  if (!settings) {
+    throw new ValidationError('Business settings not found. Please configure your business settings first.');
+  }
+
+  const pdfService = new PDFService(c.env.STORAGE, c.env.CF_ACCOUNT_ID, c.env.CF_API_TOKEN);
+  const { data: pdfData, isPdf } = await pdfService.generateInvoicePDF(invoice as InvoiceWithClient, settings);
+
+  const pdfKey = await pdfService.storePDF(invoiceId, invoice.invoice_number, pdfData, isPdf);
+
+  const now = new Date().toISOString();
+  await c.env.DB.prepare(
+    'UPDATE invoices SET pdf_generated_at = ?, updated_at = ? WHERE id = ?'
+  ).bind(now, now, invoiceId).run();
+
+  return c.json({
+    data: {
+      message: 'PDF generated successfully',
+      pdf_key: pdfKey,
+      format: isPdf ? 'pdf' : 'html',
+    },
+    requestId,
+  });
+});
+
+/**
+ * Get PDF download URL
+ */
+invoices.get('/:id/pdf', async (c) => {
+  const invoiceId = c.req.param('id');
+
+  const invoice = await c.env.DB.prepare(
+    'SELECT invoice_number FROM invoices WHERE id = ?'
+  ).bind(invoiceId).first<{ invoice_number: string }>();
+
+  if (!invoice) {
+    throw new NotFoundError('Invoice');
+  }
+
+  const pdfService = new PDFService(c.env.STORAGE, c.env.CF_ACCOUNT_ID, c.env.CF_API_TOKEN);
+  const pdf = await pdfService.getPDF(invoiceId, invoice.invoice_number);
+
+  if (!pdf) {
+    throw new NotFoundError('PDF');
+  }
+
+  return new Response(pdf.body, {
+    headers: {
+      'Content-Type': pdf.contentType,
+      'Content-Disposition': `inline; filename="${pdf.filename}"`,
+    },
+  });
+});
+
+// Helper function to get invoice with all details
+async function getInvoiceWithDetails(db: D1Database, invoiceId: string): Promise<any> {
+  const invoice = await db.prepare(
+    'SELECT * FROM invoices WHERE id = ?'
+  ).bind(invoiceId).first();
+
+  if (!invoice) return null;
+
+  const client = await db.prepare(
+    'SELECT id, name, email, company, address FROM clients WHERE id = ?'
+  ).bind(invoice.client_id).first();
+
+  const items = await db.prepare(
+    'SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order'
+  ).bind(invoiceId).all();
+
+  return {
+    ...invoice,
+    client,
+    items: items.results,
+  };
+}
+
+export { invoices };

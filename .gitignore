@@ -1,0 +1,12 @@
+node_modules
+
+# Environment variables and secrets
+.env
+.env.*
+.dev.vars
+*.local
+
+# Build outputs
+dist
+.wrangler
+.opencode/

@@ -1,0 +1,165 @@
+import { z } from 'zod';
+import {
+  clientSchema,
+  createClientSchema,
+  updateClientSchema,
+  invoiceSchema,
+  invoiceItemSchema,
+  createInvoiceSchema,
+  updateInvoiceSchema,
+  invoiceWithClientSchema,
+  invoiceEventSchema,
+  publicTokenSchema,
+  paymentSchema,
+  settingsSchema,
+  updateSettingsSchema,
+  dashboardKPIsSchema,
+  invoiceFilterSchema,
+  reminderSchema,
+  apiErrorSchema,
+  createInvoiceItemSchema,
+} from './schemas';
+import {
+  INVOICE_STATUSES,
+  CURRENCIES,
+  DISCOUNT_TYPES,
+  PAYMENT_TERMS,
+  REMINDER_TYPES,
+  INVOICE_EVENT_TYPES,
+  TIMEZONES,
+} from './constants';
+
+// ============ Inferred Types ============
+
+export type Client = z.infer<typeof clientSchema>;
+export type CreateClient = z.infer<typeof createClientSchema>;
+export type UpdateClient = z.infer<typeof updateClientSchema>;
+
+export type Invoice = z.infer<typeof invoiceSchema>;
+export type InvoiceItem = z.infer<typeof invoiceItemSchema>;
+export type CreateInvoice = z.infer<typeof createInvoiceSchema>;
+export type UpdateInvoice = z.infer<typeof updateInvoiceSchema>;
+export type InvoiceWithClient = z.infer<typeof invoiceWithClientSchema>;
+export type CreateInvoiceItem = z.infer<typeof createInvoiceItemSchema>;
+
+export type InvoiceEvent = z.infer<typeof invoiceEventSchema>;
+export type PublicToken = z.infer<typeof publicTokenSchema>;
+export type Payment = z.infer<typeof paymentSchema>;
+
+export type Settings = z.infer<typeof settingsSchema>;
+export type UpdateSettings = z.infer<typeof updateSettingsSchema>;
+
+export type DashboardKPIs = z.infer<typeof dashboardKPIsSchema>;
+export type InvoiceFilter = z.infer<typeof invoiceFilterSchema>;
+export type Reminder = z.infer<typeof reminderSchema>;
+
+export type ApiError = z.infer<typeof apiErrorSchema>;
+
+// ============ Enum Types ============
+
+export type InvoiceStatus = (typeof INVOICE_STATUSES)[number];
+export type Currency = (typeof CURRENCIES)[number];
+export type DiscountType = (typeof DISCOUNT_TYPES)[number];
+export type PaymentTerms = (typeof PAYMENT_TERMS)[number];
+export type ReminderType = (typeof REMINDER_TYPES)[number];
+export type InvoiceEventType = (typeof INVOICE_EVENT_TYPES)[number];
+export type Timezone = (typeof TIMEZONES)[number];
+
+// ============ API Response Types ============
+
+export interface PaginatedResponse<T> {
+  data: T[];
+  pagination: {
+    page: number;
+    limit: number;
+    total: number;
+    total_pages: number;
+  };
+}
+
+export interface ApiResponse<T> {
+  data: T;
+  requestId: string;
+}
+
+// ============ Dashboard Types ============
+
+export interface RecentInvoice {
+  id: string;
+  invoice_number: string;
+  client_name: string;
+  status: InvoiceStatus;
+  total: number;
+  currency: Currency;
+  due_date: string;
+  created_at: string;
+}
+
+export interface DashboardData {
+  kpis: DashboardKPIs;
+  default_currency: Currency;
+  recent_invoices: RecentInvoice[];
+}
+
+// ============ Public Invoice Types ============
+
+export interface PublicInvoiceData {
+  invoice: {
+    invoice_number: string;
+    status: InvoiceStatus;
+    issue_date: string;
+    due_date: string;
+    currency: Currency;
+    subtotal: number;
+    tax_total: number;
+    discount_amount: number | null;
+    total: number;
+    notes: string | null;
+    payment_terms: PaymentTerms | null;
+  };
+  client: {
+    name: string;
+    email: string;
+    company: string | null;
+    address: string | null;
+  };
+  business: {
+    name: string | null;
+    email: string | null;
+    address: string | null;
+    logo_url: string | null;
+  };
+  items: Array<{
+    description: string;
+    quantity: number;
+    unit_price: number;
+    tax_rate: number | null;
+    amount: number;
+  }>;
+  can_pay: boolean;
+  pdf_url: string | null;
+}
+
+// ============ Reminder Types ============
+
+export interface ReminderJob {
+  invoice_id: string;
+  reminder_type: ReminderType;
+  scheduled_at: number; // Unix timestamp
+  idempotency_key: string;
+}
+
+export interface ReminderState {
+  invoices: Record<string, {
+    reminders: ReminderJob[];
+    last_updated: number;
+  }>;
+}
+
+// ============ Analytics Types ============
+
+export interface AnalyticsEvent {
+  event: string;
+  properties: Record<string, unknown>;
+  timestamp: string;
+}

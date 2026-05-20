@@ -1,0 +1,237 @@
+import { Hono } from 'hono';
+import type { Env, Variables } from '../types';
+import type { Invoice, Client, Settings, InvoiceItem } from '@kivo/shared';
+import { NotFoundError } from '../utils/errors';
+import { generateUUID } from '../utils/crypto';
+import { publicInvoiceRateLimiter } from '../middleware/rate-limit';
+import { StripeService } from '../services/stripe';
+import { AnalyticsService } from '../services/analytics';
+import { PDFService } from '../services/pdf';
+
+const publicRoutes = new Hono<{ Bindings: Env; Variables: Variables }>();
+
+publicRoutes.use('/*', publicInvoiceRateLimiter);
+
+/**
+ * View public invoice
+ */
+publicRoutes.get('/invoice/:token', async (c) => {
+  const requestId = c.get('requestId');
+  const token = c.req.param('token');
+
+  const tokenRecord = await c.env.DB.prepare(
+    'SELECT invoice_id FROM invoice_public_tokens WHERE token = ?'
+  ).bind(token).first<{ invoice_id: string }>();
+
+  if (!tokenRecord) {
+    throw new NotFoundError('Invoice');
+  }
+
+  const invoice = await c.env.DB.prepare(
+    'SELECT * FROM invoices WHERE id = ?'
+  ).bind(tokenRecord.invoice_id).first<Invoice>();
+
+  if (!invoice) {
+    throw new NotFoundError('Invoice');
+  }
+
+  const client = await c.env.DB.prepare(
+    'SELECT name, email, company, address FROM clients WHERE id = ?'
+  ).bind(invoice.client_id).first<Partial<Client>>();
+
+  const settings = await c.env.DB.prepare(
+    'SELECT business_name, business_email, business_address, logo_url FROM settings LIMIT 1'
+  ).first<Partial<Settings>>();
+
+  const items = await c.env.DB.prepare(
+    'SELECT description, quantity, unit_price, tax_rate, amount FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order'
+  ).bind(invoice.id).all<Partial<InvoiceItem>>();
+
+  if (invoice.status === 'sent') {
+    const now = new Date().toISOString();
+
+    await c.env.DB.prepare(
+      "UPDATE invoices SET status = 'viewed', updated_at = ? WHERE id = ?"
+    ).bind(now, invoice.id).run();
+
+    await c.env.DB.prepare(
+      `INSERT INTO invoice_events (id, invoice_id, event_type, created_at)
+       VALUES (?, ?, 'viewed', ?)`
+    ).bind(generateUUID(), invoice.id, now).run();
+
+    const analytics = new AnalyticsService();
+    analytics.trackInvoiceViewed(invoice.id);
+  }
+
+  const canPay = ['sent', 'viewed', 'overdue'].includes(invoice.status);
+
+  let pdfUrl = null;
+  if (invoice.pdf_generated_at) {
+    pdfUrl = `${c.env.API_URL}/api/public/invoice/${token}/pdf`;
+  }
+
+  return c.json({
+    data: {
+      invoice: {
+        invoice_number: invoice.invoice_number,
+        status: invoice.status,
+        issue_date: invoice.issue_date,
+        due_date: invoice.due_date,
+        currency: invoice.currency,
+        subtotal: invoice.subtotal,
+        tax_total: invoice.tax_total,
+        discount_amount: invoice.discount_amount,
+        total: invoice.total,
+        notes: invoice.notes,
+        payment_terms: invoice.payment_terms,
+      },
+      client: {
+        name: client?.name,
+        email: client?.email,
+        company: client?.company,
+        address: client?.address,
+      },
+      business: {
+        name: settings?.business_name,
+        email: settings?.business_email,
+        address: settings?.business_address,
+        logo_url: settings?.logo_url,
+      },
+      items: items.results,
+      can_pay: canPay,
+      pdf_url: pdfUrl,
+    },
+    requestId,
+  });
+});
+
+/**
+ * Get public invoice PDF
+ */
+publicRoutes.get('/invoice/:token/pdf', async (c) => {
+  const token = c.req.param('token');
+
+  const tokenRecord = await c.env.DB.prepare(
+    'SELECT invoice_id FROM invoice_public_tokens WHERE token = ?'
+  ).bind(token).first<{ invoice_id: string }>();
+
+  if (!tokenRecord) {
+    throw new NotFoundError('Invoice');
+  }
+
+  const invoice = await c.env.DB.prepare(
+    'SELECT invoice_number, pdf_generated_at FROM invoices WHERE id = ?'
+  ).bind(tokenRecord.invoice_id).first<{ invoice_number: string; pdf_generated_at: string | null }>();
+
+  if (!invoice || !invoice.pdf_generated_at) {
+    throw new NotFoundError('PDF');
+  }
+
+  const pdfService = new PDFService(c.env.STORAGE, c.env.CF_ACCOUNT_ID, c.env.CF_API_TOKEN);
+  const pdf = await pdfService.getPDF(tokenRecord.invoice_id, invoice.invoice_number);
+
+  if (!pdf) {
+    throw new NotFoundError('PDF');
+  }
+
+  return new Response(pdf.body, {
+    headers: {
+      'Content-Type': pdf.contentType,
+      'Content-Disposition': `inline; filename="${pdf.filename}"`,
+    },
+  });
+});
+
+/**
+ * Create Stripe checkout session for invoice payment
+ */
+publicRoutes.post('/invoice/:token/pay', async (c) => {
+  const requestId = c.get('requestId');
+  const token = c.req.param('token');
+
+  const tokenRecord = await c.env.DB.prepare(
+    'SELECT invoice_id FROM invoice_public_tokens WHERE token = ?'
+  ).bind(token).first<{ invoice_id: string }>();
+
+  if (!tokenRecord) {
+    throw new NotFoundError('Invoice');
+  }
+
+  const invoice = await c.env.DB.prepare(
+    'SELECT * FROM invoices WHERE id = ?'
+  ).bind(tokenRecord.invoice_id).first<Invoice>();
+
+  if (!invoice) {
+    throw new NotFoundError('Invoice');
+  }
+
+  if (!['sent', 'viewed', 'overdue'].includes(invoice.status)) {
+    return c.json({
+      error: {
+        code: 'INVOICE_NOT_PAYABLE',
+        message: 'This invoice cannot be paid',
+      },
+      requestId,
+    }, 400);
+  }
+
+  const client = await c.env.DB.prepare(
+    'SELECT email FROM clients WHERE id = ?'
+  ).bind(invoice.client_id).first<{ email: string }>();
+
+  const settings = await c.env.DB.prepare(
+    'SELECT business_name FROM settings LIMIT 1'
+  ).first<{ business_name: string }>();
+
+  const stripeService = new StripeService(c.env.STRIPE_SECRET_KEY, c.env.STRIPE_WEBHOOK_SECRET);
+
+  const successUrl = `${c.env.FRONTEND_URL}/invoice/${token}?payment=success`;
+  const cancelUrl = `${c.env.FRONTEND_URL}/invoice/${token}?payment=cancelled`;
+
+  const session = await stripeService.createCheckoutSession(
+    invoice.id,
+    invoice.invoice_number,
+    invoice.total,
+    invoice.currency as any,
+    client?.email || '',
+    successUrl,
+    cancelUrl,
+    settings?.business_name
+  );
+
+  const now = new Date().toISOString();
+  await c.env.DB.prepare(
+    `INSERT INTO payments (id, invoice_id, stripe_checkout_session_id, amount, currency, status, created_at)
+     VALUES (?, ?, ?, ?, ?, 'pending', ?)`
+  ).bind(generateUUID(), invoice.id, session.sessionId, invoice.total, invoice.currency, now).run();
+
+  return c.json({
+    data: {
+      checkout_url: session.url,
+      session_id: session.sessionId,
+    },
+    requestId,
+  });
+});
+
+/**
+ * Get demo video
+ */
+publicRoutes.get('/demo-video', async (c) => {
+  const videoKey = 'demo/kivo.mp4';
+
+  const object = await c.env.STORAGE.get(videoKey);
+
+  if (!object) {
+    throw new NotFoundError('Demo video');
+  }
+
+  const headers = new Headers();
+  headers.set('Content-Type', 'video/mp4');
+  headers.set('Cache-Control', 'public, max-age=31536000');
+  headers.set('Accept-Ranges', 'bytes');
+
+  return new Response(object.body, { headers });
+});
+
+export { publicRoutes };
