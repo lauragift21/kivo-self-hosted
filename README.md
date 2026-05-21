@@ -1,4 +1,6 @@
-# Kivo
+<h1 align="center">
+Kivo
+</h1>
 
 <p align="center">
   <strong>Self-hosted invoicing for freelancers and small businesses</strong><br>
