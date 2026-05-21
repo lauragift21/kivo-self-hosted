@@ -11,6 +11,10 @@ import {
   Zap,
   Send,
   BarChart3,
+  CheckCircle2,
+  Circle,
+  Settings,
+  UserPlus,
 } from 'lucide-react';
 import { formatCurrency } from '@kivo/shared';
 import { AppLayout } from '@/components/layout/app-layout';
@@ -19,7 +23,8 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
-import { dashboardApi } from '@/lib/api';
+import { dashboardApi, onboardingApi } from '@/lib/api';
+import { cn } from '@/lib/utils';
 
 function getDueDateDisplay(dueDate: string, status: string) {
   if (status === 'settled' || status === 'paid' || status === 'void' || status === 'draft') {
@@ -54,10 +59,103 @@ function getDueDateDisplay(dueDate: string, status: string) {
   }
 }
 
+function GettingStartedCard({
+  hasClients,
+  hasInvoices,
+}: {
+  hasClients: boolean;
+  hasInvoices: boolean;
+}) {
+  const steps = [
+    {
+      label: 'Set up your business profile',
+      done: true,
+      href: '/settings' as const,
+      icon: Settings,
+    },
+    {
+      label: 'Add your first client',
+      done: hasClients,
+      href: '/clients/new' as const,
+      icon: UserPlus,
+    },
+    {
+      label: 'Create your first invoice',
+      done: hasInvoices,
+      href: '/invoices/new' as const,
+      icon: FileText,
+    },
+  ];
+
+  const completed = steps.filter((s) => s.done).length;
+  const allDone = completed === steps.length;
+
+  if (allDone) return null;
+
+  return (
+    <Card className="mb-8 border-primary/20 bg-primary/5">
+      <CardContent className="p-6">
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <h3 className="font-semibold text-lg">Getting started</h3>
+            <p className="text-sm text-muted-foreground">
+              Complete these steps to start invoicing like a pro
+            </p>
+          </div>
+          <div className="text-sm font-medium text-primary">
+            {completed}/{steps.length}
+          </div>
+        </div>
+        <div className="space-y-2">
+          {steps.map((step) => {
+            const Icon = step.icon;
+            return (
+              <Link
+                key={step.label}
+                to={step.href}
+                className={cn(
+                  'flex items-center gap-3 p-3 rounded-lg transition-colors',
+                  step.done
+                    ? 'opacity-60'
+                    : 'bg-card hover:bg-muted/50 border border-transparent hover:border-border'
+                )}
+              >
+                {step.done ? (
+                  <CheckCircle2 className="h-5 w-5 text-status-settled shrink-0" />
+                ) : (
+                  <Circle className="h-5 w-5 text-muted-foreground shrink-0" />
+                )}
+                <Icon className="h-4 w-4 text-muted-foreground shrink-0" />
+                <span
+                  className={cn(
+                    'text-sm',
+                    step.done ? 'line-through text-muted-foreground' : 'font-medium'
+                  )}
+                >
+                  {step.label}
+                </span>
+                {!step.done && (
+                  <ChevronRight className="ml-auto h-4 w-4 text-muted-foreground" />
+                )}
+              </Link>
+            );
+          })}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 export function DashboardPage() {
   const { data, isLoading } = useQuery({
     queryKey: ['dashboard'],
     queryFn: dashboardApi.get,
+  });
+
+  const { data: onboardingStatus } = useQuery({
+    queryKey: ['onboarding-status'],
+    queryFn: onboardingApi.getStatus,
+    staleTime: 1000 * 60 * 5,
   });
 
   return (
@@ -74,6 +172,13 @@ export function DashboardPage() {
           </Link>
         }
       />
+
+      {onboardingStatus && !onboardingStatus.has_invoices && (
+        <GettingStartedCard
+          hasClients={onboardingStatus.has_clients}
+          hasInvoices={onboardingStatus.has_invoices}
+        />
+      )}
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4 mb-8">
         <Card className="relative overflow-hidden">

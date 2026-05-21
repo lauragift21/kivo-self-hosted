@@ -256,5 +256,37 @@ const result = await c.env.DB.prepare(
 - **Payments**: Stripe integration (optional)
 - **State Management**: TanStack Query for server state
 - **Forms**: react-hook-form with Zod validation
-- **Email**: Resend for transactional email (invoice sending, reminders, receipts)
+- **Email**: Cloudflare Email Service (`send_email` binding) for transactional email — invoice sending, reminders, receipts. No API keys needed. In local dev, emails are logged to console instead of sent.
 - **PDF Generation**: Cloudflare Browser Rendering API with HTML fallback
+
+## Onboarding Architecture
+
+The app has a lightweight onboarding system that guides new business owners through setup:
+
+### API
+- `GET /api/onboarding/status` — Returns `business_setup`, `has_clients`, `has_invoices`, `business_name`
+- `POST /api/onboarding/test-email` — Diagnostic endpoint to verify email configuration
+
+### Frontend Flow
+1. Router (`/`) checks `localStorage` for `kivo.onboarding_complete`
+   - Missing → redirects to `/onboarding`
+   - Present → redirects to `/dashboard`
+2. Onboarding wizard (`/onboarding`): 5 guided steps
+   - Step 1: Welcome screen with feature highlights
+   - Step 2: Business profile (name, email, address, logo) with live invoice preview
+   - Step 3: Invoice preferences (currency, payment terms, prefix)
+   - Step 4: First client (optional — can skip)
+   - Step 5: Completion screen with CTAs
+3. `AppLayout` has an `OnboardingCheck` component that:
+   - Reads `localStorage` first (instant, no API call)
+   - Falls back to `GET /api/onboarding/status` in background
+   - **Never blocks rendering** — children render immediately
+   - Redirects to `/onboarding` only if `business_setup === false`
+4. Dashboard shows a "Getting Started" checklist for users with no invoices yet, guiding them to add a client and create their first invoice
+5. After onboarding completes, calling `markOnboardingComplete()` sets `localStorage` so future visits skip checks entirely
+
+### Design Principles
+- **Zero friction**: No auth, no signup forms, no modal dialogs
+- **Instant render**: Returning users see content immediately (no loading spinners)
+- **Non-technical friendly**: Live invoice preview, plain-language labels, skip options
+- **Always escapable**: Every step can be skipped, except business profile which is required for invoices

@@ -32,7 +32,7 @@ Kivo is an open-source invoicing application designed for **business-to-customer
 - **Client Management** — Create, edit, archive clients with full contact details
 - **Invoice Lifecycle** — Draft → Send → View → Pay → Track. Full status history.
 - **Real PDF Generation** — Professional invoices via Cloudflare Browser Rendering API, stored in R2
-- **Email Delivery** — Send invoices, payment reminders, and receipts via Resend
+- **Email Delivery** — Send invoices, payment reminders, and receipts via Cloudflare Email Service (no API keys needed)
 - **Online Payments** — Stripe Checkout integration for card payments (optional)
 - **Automatic Reminders** — Durable Objects schedule and send payment reminders
 - **Dashboard** — Outstanding totals, monthly revenue, status breakdowns
@@ -184,19 +184,17 @@ https://kivo.YOUR-SUBDOMAIN.workers.dev
 
 ### Step 10: First-Time Setup
 
-Open your deployed URL in a browser. You'll land on the Dashboard.
+Open your deployed URL in a browser. You'll be guided through a **5-step onboarding wizard**:
 
-1. Click **Settings** in the sidebar
-2. Fill in:
-   - **Business Name** — appears on invoices
-   - **Business Email** — reply-to address
-   - **Default Currency** — USD, EUR, GBP, etc.
-   - **Invoice Prefix** — e.g., `INV` generates `INV-001`, `INV-002`
-   - **Email From Name** — e.g., "Gift from Freelance Studio"
-3. Upload your **Logo** (optional)
-4. Save
+1. **Welcome** — Quick intro to what Kivo does
+2. **Business Profile** — Business name, email, address, and logo (with live invoice preview)
+3. **Invoice Preferences** — Default currency, payment terms, invoice prefix
+4. **First Client** — Add your first client (or skip)
+5. **All Set** — Celebration screen with quick links to create your first invoice or explore the dashboard
 
-That's it. No signup forms. No user accounts. Just start invoicing.
+After onboarding, a "Getting Started" checklist appears on the Dashboard until you create your first invoice.
+
+No signup forms. No user accounts. Just start invoicing.
 
 ### Optional: Enable Online Payments (Stripe)
 
@@ -288,9 +286,15 @@ Delete the worker and the data is gone. Cloudflare has the data, but only in you
 ## Troubleshooting
 
 **Emails not sending?**
-- Check that `FROM_EMAIL` uses a domain enabled for Cloudflare Email Service: `npx wrangler email sending list`
-- Enable the domain: `npx wrangler email sending enable your-domain.com`
-- Verify the `send_email` binding exists in `wrangler.jsonc`
+- Check that `FROM_EMAIL` uses a domain enabled for Cloudflare Email Service:
+  ```bash
+  npx wrangler email sending list
+  ```
+- If your domain isn't listed, enable it:
+  ```bash
+  npx wrangler email sending enable your-domain.com
+  ```
+- In local development, emails are logged to the console instead of sent (the binding is a stub). Look for `=== EMAIL PREVIEW ===` in the wrangler logs.
 
 **PDFs not generating?**
 - `CF_API_TOKEN` is optional — without it, Kivo generates HTML instead of PDF

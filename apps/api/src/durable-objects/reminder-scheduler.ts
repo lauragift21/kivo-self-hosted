@@ -222,18 +222,20 @@ export class ReminderScheduler implements DurableObject {
 
       const publicUrl = `${this.env.FRONTEND_URL}/invoice/${publicToken.token}`;
 
-      const response = await this.env.EMAIL.send({
+      const fromEmail = this.env.FROM_EMAIL;
+      const fromAddress = settings?.email_from_name
+        ? { email: fromEmail, name: settings.email_from_name }
+        : { email: fromEmail };
+
+      await this.env.EMAIL.send({
         to: invoice.client_email,
-        from: {
-          email: this.env.FROM_EMAIL,
-          name: settings?.email_from_name || settings?.business_name || 'Kivo',
-        },
+        from: fromAddress,
         subject: this.getReminderSubject(invoice.invoice_number, reminderType),
         html: this.getReminderHTML(invoice, settings, publicUrl, reminderType),
-        text: `Invoice ${invoice.invoice_number}. Amount: ${invoice.currency} ${invoice.total}. Due: ${new Date(invoice.due_date).toLocaleDateString()}. View: ${publicUrl}`,
+        text: this.getReminderText(invoice, settings, publicUrl, reminderType),
       });
 
-      return response.ok;
+      return true;
     } catch (error) {
       console.error('Failed to send reminder:', error);
       return false;
@@ -248,8 +250,6 @@ export class ReminderScheduler implements DurableObject {
         return `Invoice ${invoiceNumber} is due today`;
       case 'after_due':
         return `Overdue: Invoice ${invoiceNumber} requires attention`;
-      default:
-        return `Reminder: Invoice ${invoiceNumber}`;
     }
   }
 
@@ -272,6 +272,17 @@ export class ReminderScheduler implements DurableObject {
       </body>
       </html>
     `;
+  }
+
+  private getReminderText(invoice: any, settings: any, publicUrl: string, reminderType: ReminderType): string {
+    const businessName = settings?.business_name || 'Kivo';
+    const messages = {
+      before_due: 'This is a friendly reminder that the following invoice is due soon.',
+      on_due: 'This is a reminder that the following invoice is due today.',
+      after_due: 'This invoice is now overdue. Please arrange payment at your earliest convenience.',
+    };
+
+    return `${businessName}\n\nInvoice ${invoice.invoice_number}\n${messages[reminderType]}\n\nAmount: ${invoice.currency} ${invoice.total}\nDue: ${new Date(invoice.due_date).toLocaleDateString()}\n\nView and pay: ${publicUrl}`;
   }
 
   private async recordReminderSent(invoiceId: string, reminderType: ReminderType, idempotencyKey: string): Promise<void> {

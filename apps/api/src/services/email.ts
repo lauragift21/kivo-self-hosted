@@ -1,16 +1,39 @@
+import { EmailMessage } from 'cloudflare:email';
 import { ExternalServiceError } from '../utils/errors';
 import { createLogger } from '../utils/logger';
 import type { Currency } from '@kivo/shared';
 import { formatCurrency } from '@kivo/shared';
-import type { SendEmail } from '../types';
+import type { SendEmail } from '@cloudflare/workers-types';
 
-interface EmailOptions {
-  to: string;
-  subject: string;
-  html: string;
-  text: string;
-  fromEmail: string;
-  fromName?: string;
+function buildMimeMessage(
+  to: string,
+  fromEmail: string,
+  fromName: string | undefined,
+  subject: string,
+  html: string,
+  text: string
+): string {
+  const boundary = `----=_Part_${Math.random().toString(36).slice(2)}`;
+  const sender = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+
+  return [
+    'MIME-Version: 1.0',
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    `From: ${sender}`,
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/plain; charset="utf-8"',
+    '',
+    text,
+    `--${boundary}`,
+    'Content-Type: text/html; charset="utf-8"',
+    '',
+    html,
+    `--${boundary}--`,
+    '',
+  ].join('\r\n');
 }
 
 export class EmailService {
@@ -24,24 +47,55 @@ export class EmailService {
     this.logger = createLogger();
   }
 
-  private async send(options: EmailOptions): Promise<void> {
-    const response = await this.email.send({
-      to: options.to,
-      from: {
-        email: options.fromEmail,
-        name: options.fromName,
-      },
-      subject: options.subject,
-      html: options.html,
-      text: options.text,
-    });
+  private async send(options: {
+    to: string;
+    subject: string;
+    html: string;
+    text?: string;
+    fromName?: string;
+  }): Promise<void> {
+    const text = options.text || options.html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const raw = buildMimeMessage(
+      options.to,
+      this.fromEmail,
+      options.fromName,
+      options.subject,
+      options.html,
+      text
+    );
 
-    if (!response.ok) {
-      this.logger.error('Failed to send email', new Error('Email send failed'), { to: options.to });
-      throw new ExternalServiceError('Email', 'Failed to send email');
+    // In local development the EMAIL binding is a stub that can't send.
+    // Log the email instead so the developer can inspect it.
+    const isLocalDev = typeof this.email.send !== 'function';
+    if (isLocalDev) {
+      this.logger.info('[LOCAL DEV] Email would be sent', {
+        to: options.to,
+        from: this.fromEmail,
+        fromName: options.fromName,
+        subject: options.subject,
+        htmlLength: options.html.length,
+      });
+      console.log('\n=== EMAIL PREVIEW ===\n');
+      console.log(raw);
+      console.log('\n=== END EMAIL PREVIEW ===\n');
+      return;
     }
 
-    this.logger.info('Email sent successfully', { to: options.to, subject: options.subject });
+    try {
+      const msg = new EmailMessage(this.fromEmail, options.to, raw);
+      await this.email.send(msg);
+
+      this.logger.info('Email sent successfully', {
+        to: options.to,
+        subject: options.subject,
+      });
+    } catch (error: any) {
+      this.logger.error('Failed to send email', error, { to: options.to });
+      throw new ExternalServiceError(
+        'Cloudflare Email',
+        `Failed to send email: ${error.message || error.code || 'Unknown error'}`
+      );
+    }
   }
 
   async sendMagicLink(email: string, token: string, frontendUrl: string): Promise<void> {
@@ -49,7 +103,6 @@ export class EmailService {
 
     await this.send({
       to: email,
-      fromEmail: this.fromEmail,
       subject: 'Sign in to Kivo',
       html: `
         <!DOCTYPE html>
@@ -74,7 +127,6 @@ export class EmailService {
         </body>
         </html>
       `,
-      text: `Sign in to Kivo: ${magicLink}. This link expires in 15 minutes.`,
     });
   }
 
@@ -90,7 +142,6 @@ export class EmailService {
   ): Promise<void> {
     await this.send({
       to,
-      fromEmail: this.fromEmail,
       fromName: fromName || businessName,
       subject: `Invoice ${invoiceNumber} from ${businessName || 'Kivo'}`,
       html: `
@@ -126,7 +177,6 @@ export class EmailService {
         </body>
         </html>
       `,
-      text: `Invoice ${invoiceNumber} from ${businessName || 'Kivo'}. Amount due: ${formatCurrency(total, currency)}. Due: ${new Date(dueDate).toLocaleDateString()}. View: ${publicUrl}`,
     });
   }
 
@@ -155,7 +205,6 @@ export class EmailService {
 
     await this.send({
       to,
-      fromEmail: this.fromEmail,
       fromName: fromName || businessName,
       subject: subjects[reminderType],
       html: `
@@ -192,7 +241,6 @@ export class EmailService {
         </body>
         </html>
       `,
-      text: `${subjects[reminderType]}. Amount due: ${formatCurrency(total, currency)}. Due: ${new Date(dueDate).toLocaleDateString()}. View: ${publicUrl}`,
     });
   }
 
@@ -207,7 +255,6 @@ export class EmailService {
   ): Promise<void> {
     await this.send({
       to,
-      fromEmail: this.fromEmail,
       fromName: fromName || businessName,
       subject: `Payment received for Invoice ${invoiceNumber}`,
       html: `
@@ -250,7 +297,6 @@ export class EmailService {
         </body>
         </html>
       `,
-      text: `Payment received for Invoice ${invoiceNumber}. Amount: ${formatCurrency(amount, currency)}. Date: ${new Date(paidAt).toLocaleDateString()}. Thank you!`,
     });
   }
 }

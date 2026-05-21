@@ -10,6 +10,7 @@ import { publicRoutes } from './routes/public';
 import { webhooks } from './routes/webhooks';
 import { dashboard } from './routes/dashboard';
 import { settings } from './routes/settings';
+import { onboarding } from './routes/onboarding';
 import { createLogger } from './utils/logger';
 
 // Export Durable Object
@@ -66,6 +67,7 @@ app.route('/api/public', publicRoutes);
 app.route('/api/webhooks', webhooks);
 app.route('/api/dashboard', dashboard);
 app.route('/api/settings', settings);
+app.route('/api/onboarding', onboarding);
 
 // 404 handler
 app.notFound((c) => {

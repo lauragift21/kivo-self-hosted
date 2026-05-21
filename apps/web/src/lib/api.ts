@@ -268,4 +268,17 @@ export const settingsApi = {
   },
 };
 
+// Onboarding API
+export const onboardingApi = {
+  getStatus: async (): Promise<{
+    business_setup: boolean;
+    has_clients: boolean;
+    has_invoices: boolean;
+    business_name: string | null;
+  }> => {
+    const response = await fetch(`${API_BASE}/onboarding/status`);
+    return handleResponse(response);
+  },
+};
+
 export { ApiError };

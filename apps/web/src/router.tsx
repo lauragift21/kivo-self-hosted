@@ -1,5 +1,13 @@
 import { createRouter, createRoute, createRootRoute, Outlet, redirect } from '@tanstack/react-router';
 
+function isOnboardingComplete(): boolean {
+  try {
+    return localStorage.getItem('kivo.onboarding_complete') === 'true';
+  } catch {
+    return false;
+  }
+}
+
 // Pages
 import { DashboardPage } from '@/pages/dashboard';
 import { ClientsListPage } from '@/pages/clients/list';
@@ -11,17 +19,21 @@ import { SettingsPage } from '@/pages/settings';
 import { PublicInvoicePage } from '@/pages/public-invoice';
 import { PrivacyPage } from '@/pages/privacy';
 import { TermsPage } from '@/pages/terms';
+import { OnboardingPage } from '@/pages/onboarding';
 
 // Root route
 const rootRoute = createRootRoute({
   component: () => <Outlet />,
 });
 
-// Redirect root to dashboard
+// Redirect root to onboarding (fresh) or dashboard (returning)
 const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/',
   beforeLoad: () => {
+    if (!isOnboardingComplete()) {
+      throw redirect({ to: '/onboarding' });
+    }
     throw redirect({ to: '/dashboard' });
   },
   component: DashboardPage,
@@ -114,6 +126,13 @@ const invoicesEditRoute = createRoute({
   component: InvoiceFormPage,
 });
 
+// Onboarding route
+const onboardingRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: 'onboarding',
+  component: OnboardingPage,
+});
+
 // Settings route
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -127,6 +146,7 @@ const routeTree = rootRoute.addChildren([
   privacyRoute,
   termsRoute,
   publicInvoiceRoute,
+  onboardingRoute,
   dashboardRoute,
   clientsRoute.addChildren([clientsIndexRoute, clientsNewRoute, clientsEditRoute]),
   invoicesRoute.addChildren([invoicesIndexRoute, invoicesNewRoute, invoicesDetailRoute, invoicesEditRoute]),
